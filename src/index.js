@@ -1,5 +1,8 @@
 
-const MODEL = "gemini-3.8-flash";
+const MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.7-flash"
+];
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -19,6 +22,92 @@ function toBase64(bytes) {
   }
 
   return btoa(binary);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isTemporaryError(status) {
+  return [408, 429, 500, 502, 503, 504].includes(status);
+}
+
+async function callGemini(model, apiKey, contents) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey
+          },
+          body: JSON.stringify({
+            contents,
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.1
+            }
+          }),
+          signal: AbortSignal.timeout(90000)
+        }
+      );
+
+      const raw = await response.text();
+      let data;
+
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        data = { error: { message: raw } };
+      }
+
+      if (response.ok) {
+        return {
+          ok: true,
+          model,
+          data
+        };
+      }
+
+      lastError = {
+        status: response.status,
+        message: data.error?.message || "Servizio AI non disponibile."
+      };
+
+      if (!isTemporaryError(response.status)) {
+        return {
+          ok: false,
+          model,
+          ...lastError
+        };
+      }
+
+    } catch (error) {
+      lastError = {
+        status: 0,
+        message: error.name === "TimeoutError"
+          ? "Timeout durante la comunicazione con Gemini."
+          : error.message
+      };
+    }
+
+    if (attempt === 0) {
+      await sleep(1500);
+    }
+  }
+
+  return {
+    ok: false,
+    model,
+    ...(lastError || {
+      status: 502,
+      message: "Comunicazione con Gemini non riuscita."
+    })
+  };
 }
 
 export default {
@@ -51,12 +140,15 @@ export default {
         }
 
         const form = await request.formData();
+
         const files = form.getAll("images").filter(
           item => item && typeof item.arrayBuffer === "function"
         );
 
         const mode = String(form.get("mode") || "both");
-        const subject = String(form.get("subject") || "Riconoscimento automatico");
+        const subject = String(
+          form.get("subject") || "Riconoscimento automatico"
+        );
 
         if (files.length === 0) {
           return json({
@@ -100,7 +192,9 @@ export default {
             }, 413);
           }
 
-          const bytes = new Uint8Array(await file.arrayBuffer());
+          const bytes = new Uint8Array(
+            await file.arrayBuffer()
+          );
 
           imageParts.push({
             inlineData: {
@@ -161,47 +255,55 @@ Se un'immagine è illeggibile, segnala il problema nel campo warning.
 Non aggiungere testo fuori dal JSON.
 `;
 
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-goog-api-key": env.GEMINI_API_KEY
-            },
-            body: JSON.stringify({
-              contents: [{
-                role: "user",
-                parts: [
-                  { text: prompt },
-                  ...imageParts
-                ]
-              }],
-              generationConfig: {
-                responseMimeType: "application/json",
-                temperature: 0.1
-              }
-            }),
-            signal: AbortSignal.timeout(90000)
-          }
+        const contents = [{
+          role: "user",
+          parts: [
+            { text: prompt },
+            ...imageParts
+          ]
+        }];
+
+        // Primo tentativo: Gemini 3.8 Flash
+        let result = await callGemini(
+          MODELS[0],
+          env.GEMINI_API_KEY,
+          contents
         );
 
-        const result = await response.json();
+        // Se il primo modello non è disponibile,
+        // prova automaticamente Gemini 3.7 Flash.
+        if (
+          !result.ok &&
+          (
+            isTemporaryError(result.status) ||
+            result.status === 404 ||
+            result.status === 0
+          )
+        ) {
+          result = await callGemini(
+            MODELS[1],
+            env.GEMINI_API_KEY,
+            contents
+          );
+        }
 
-        if (!response.ok) {
+        if (!result.ok) {
           return json({
-            error: "Errore durante la comunicazione con Gemini.",
-            details: result.error?.message || "Servizio AI non disponibile."
+            error: "Gemini non è riuscito a elaborare il quiz.",
+            details: result.message,
+            model: result.model,
+            status: result.status
           }, 502);
         }
 
-        const output = result.candidates?.[0]?.content?.parts
+        const output = result.data.candidates?.[0]?.content?.parts
           ?.map(part => part.text || "")
           .join("");
 
         if (!output) {
           return json({
-            error: "Gemini non ha restituito una risposta leggibile."
+            error: "Gemini non ha restituito una risposta leggibile.",
+            model: result.model
           }, 502);
         }
 
@@ -223,6 +325,7 @@ Non aggiungere testo fuori dal JSON.
 
         return json({
           success: true,
+          model: result.model,
           questions: parsed.questions
         });
 
@@ -237,13 +340,17 @@ Non aggiungere testo fuori dal JSON.
     }
 
     if (url.pathname.startsWith("/api/")) {
-      return json({ error: "Endpoint non trovato." }, 404);
+      return json({
+        error: "Endpoint non trovato."
+      }, 404);
     }
 
     if (env.ASSETS) {
       return env.ASSETS.fetch(request);
     }
 
-    return new Response("Sito non disponibile.", { status: 404 });
+    return new Response("Sito non disponibile.", {
+      status: 404
+    });
   }
 };

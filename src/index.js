@@ -4,9 +4,13 @@ const MODELS = [
   "gemini-3.7-flash",
   "gemini-3.6-flash"
 ];
+const MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.7-flash"
+];
 
-const MAX_ATTEMPTS_PER_MODEL = 2;
-const TIMEOUT_MS = 90000;
+const MAX_ATTEMPTS_PER_MODEL = 1;
+const TIMEOUT_MS = 30000;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {

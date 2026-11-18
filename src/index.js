@@ -1,14 +1,24 @@
 
 const MODELS = [
   "gemini-3.8-flash",
-  "gemini-3.7-flash"
+  "gemini-3.7-flash",
+  "gemini-3.6-flash"
 ];
+
+const MAX_ATTEMPTS_PER_MODEL = 2;
+const TIMEOUT_MS = 90000;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8" }
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    }
   });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function toBase64(bytes) {
@@ -24,18 +34,16 @@ function toBase64(bytes) {
   return btoa(binary);
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function isTemporaryError(status) {
-  return [408, 429, 500, 502, 503, 504].includes(status);
+  return [
+    0, 408, 429, 500, 502, 503, 504
+  ].includes(status);
 }
 
 async function callGemini(model, apiKey, contents) {
   let lastError = null;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_MODEL; attempt++) {
     try {
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -46,67 +54,113 @@ async function callGemini(model, apiKey, contents) {
             "x-goog-api-key": apiKey
           },
           body: JSON.stringify({
-            contents,
+            contents: [{
+              role: "user",
+              parts: contents
+            }],
             generationConfig: {
               responseMimeType: "application/json",
               temperature: 0.1
             }
           }),
-          signal: AbortSignal.timeout(90000)
+          signal: AbortSignal.timeout(TIMEOUT_MS)
         }
       );
 
-      const raw = await response.text();
-      let data;
+      const responseText = await response.text();
+
+      let result;
 
       try {
-        data = JSON.parse(raw);
+        result = JSON.parse(responseText);
       } catch {
-        data = { error: { message: raw } };
+        result = {};
       }
 
-      if (response.ok) {
-        return {
-          ok: true,
-          model,
-          data
+      if (!response.ok) {
+        lastError = {
+          status: response.status,
+          message: result.error?.message ||
+            "Il servizio Gemini non ha restituito una risposta valida."
         };
-      }
 
-      lastError = {
-        status: response.status,
-        message: data.error?.message || "Servizio AI non disponibile."
-      };
+        if (
+          attempt < MAX_ATTEMPTS_PER_MODEL &&
+          isTemporaryError(response.status)
+        ) {
+          await sleep(attempt === 1 ? 2000 : 4000);
+          continue;
+        }
 
-      if (!isTemporaryError(response.status)) {
         return {
-          ok: false,
-          model,
+          success: false,
           ...lastError
         };
       }
+
+      const output = result.candidates?.[0]?.content?.parts
+        ?.map(part => part.text || "")
+        .join("");
+
+      if (!output) {
+        lastError = {
+          status: 502,
+          message: "Gemini non ha restituito un testo leggibile."
+        };
+
+        return {
+          success: false,
+          ...lastError
+        };
+      }
+
+      let parsed;
+
+      try {
+        parsed = JSON.parse(output);
+      } catch {
+        lastError = {
+          status: 502,
+          message: "Gemini ha restituito un JSON non valido."
+        };
+
+        return {
+          success: false,
+          ...lastError
+        };
+      }
+
+      if (!Array.isArray(parsed.questions)) {
+        return {
+          success: false,
+          status: 502,
+          message: "Non è stato possibile individuare le domande."
+        };
+      }
+
+      return {
+        success: true,
+        model,
+        questions: parsed.questions
+      };
 
     } catch (error) {
       lastError = {
         status: 0,
         message: error.name === "TimeoutError"
-          ? "Timeout durante la comunicazione con Gemini."
-          : error.message
+          ? "Tempo di risposta Gemini scaduto."
+          : error.message || "Errore di connessione a Gemini."
       };
-    }
 
-    if (attempt === 0) {
-      await sleep(1500);
+      if (attempt < MAX_ATTEMPTS_PER_MODEL) {
+        await sleep(attempt === 1 ? 2000 : 4000);
+      }
     }
   }
 
   return {
-    ok: false,
-    model,
-    ...(lastError || {
-      status: 502,
-      message: "Comunicazione con Gemini non riuscita."
-    })
+    success: false,
+    ...lastError
   };
 }
 
@@ -114,14 +168,20 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/api/health" && request.method === "GET") {
+    if (
+      url.pathname === "/api/health" &&
+      request.method === "GET"
+    ) {
       return json({
         status: "online",
         geminiConfigured: Boolean(env.GEMINI_API_KEY)
       });
     }
 
-    if (url.pathname === "/api/solve" && request.method === "POST") {
+    if (
+      url.pathname === "/api/solve" &&
+      request.method === "POST"
+    ) {
       try {
         if (!env.GEMINI_API_KEY) {
           return json({
@@ -147,7 +207,7 @@ export default {
 
         const mode = String(form.get("mode") || "both");
         const subject = String(
-          form.get("subject") || "Riconoscimento automatico"
+          form.get("subject") || "Statistica"
         );
 
         if (files.length === 0) {
@@ -205,128 +265,142 @@ export default {
         }
 
         const prompt = `
-Sei RISOLVI QUIZ PROFESSIONAL 2.0, un assistente specializzato
-nella risoluzione di quiz universitari italiani.
+Sei RISOLVI QUIZ PROFESSIONAL, un assistente specializzato
+nella risoluzione e verifica di quiz universitari italiani.
 
-MATERIE:
-- Statistica
-- Economia aziendale
-- Economia politica
-- Teorie e governo dell'impresa
-- Diritto d'impresa
-- Diritto privato
+OBIETTIVO PRINCIPALE:
+Risolvere quiz di STATISTICA con precisione matematica,
+controllando ogni risposta prima di restituirla.
 
 MATERIA SELEZIONATA: ${subject}
 MODALITÀ: ${mode}
 
-ISTRUZIONI:
-1. Analizza tutte le immagini caricate.
-2. Individua e trascrivi ogni domanda e tutte le alternative visibili.
-3. Rispetta la numerazione originale.
-4. Seleziona la risposta corretta tra A, B, C e D.
-5. In Statistica controlla formule, passaggi e calcoli.
-6. In Economia verifica definizioni, teorie e relazioni economiche.
-7. In Diritto applica correttamente norme, istituti e definizioni.
-8. Non inventare domande, alternative o dati illeggibili.
-9. Controlla la coerenza della risposta prima di restituirla.
-10. Se non sei sicuro, segnala il dubbio: non inventare una certezza.
+REGOLE OBBLIGATORIE:
 
-Restituisci esclusivamente JSON valido con questa struttura:
+1. Analizza tutte le immagini caricate, senza saltarne nessuna.
+
+2. Individua e trascrivi ogni domanda e tutte le alternative
+   disponibili, rispettando la numerazione originale.
+
+3. Leggi con attenzione simboli matematici, indici, esponenti,
+   parentesi, frazioni, percentuali e unità di misura.
+
+4. Distingui correttamente concetti statistici come:
+   media aritmetica, mediana, moda, varianza, deviazione standard,
+   frequenze, probabilità, distribuzioni, correlazione,
+   regressione, campionamento e inferenza statistica.
+
+5. Per ogni esercizio numerico:
+   - identifica i dati forniti;
+   - individua la formula corretta;
+   - sostituisci i valori senza alterare i dati;
+   - esegui i calcoli in modo ordinato;
+   - controlla il risultato;
+   - confronta il risultato con tutte le alternative.
+
+6. Controlla attentamente le differenze tra:
+   - varianza e deviazione standard;
+   - popolazione e campione;
+   - frequenza assoluta e relativa;
+   - probabilità semplice e condizionata;
+   - correlazione e causalità;
+   - percentuale e valore decimale.
+
+7. Non scegliere una risposta soltanto perché sembra plausibile.
+   La risposta deve essere coerente con la teoria o con il calcolo.
+
+8. Prima di assegnare A, B, C o D, verifica che il testo
+   dell'alternativa corrisponda effettivamente al risultato.
+
+9. Se nessuna alternativa coincide con il risultato,
+   segnala il problema nel campo warning.
+   Non forzare una risposta.
+
+10. Se un dato, una formula o una parte della domanda
+    non è leggibile, dichiaralo esplicitamente.
+
+11. Non inventare domande, numeri, formule o alternative.
+
+12. Non dichiarare una risposta verificata se non hai
+    effettivamente controllato il procedimento.
+
+13. In caso di dubbio, indica confidence "bassa"
+    e descrivi il motivo.
+
+MODALITÀ DI RISPOSTA:
+
+- Se mode è "exam", fornisci risposte concise,
+  mantenendo numero, lettera e risultato essenziale.
+
+- Se mode è "both", fornisci trascrizione, risposta,
+  spiegazione e procedimento di verifica.
+
+RESTITUISCI ESCLUSIVAMENTE JSON VALIDO
+con questa struttura:
 
 {
   "questions": [
     {
       "number": 1,
       "subject": "Statistica",
-      "question": "Testo della domanda",
+      "question": "Testo completo della domanda",
       "answer": "A",
       "confidence": "alta",
       "verification": "Verificata",
       "explanation": "Spiegazione della risposta",
-      "calculation": "Formula o calcolo, se necessario",
-      "verification_details": "Controllo effettuato",
+      "calculation": "Formula e passaggi del calcolo",
+      "verification_details": "Controllo matematico effettuato",
       "warning": ""
     }
   ]
 }
 
-Se la modalità è exam, mantieni le risposte concise.
-Se un'immagine è illeggibile, segnala il problema nel campo warning.
 Non aggiungere testo fuori dal JSON.
 `;
 
-        const contents = [{
-          role: "user",
-          parts: [
-            { text: prompt },
-            ...imageParts
-          ]
-        }];
+        const contents = [
+          { text: prompt },
+          ...imageParts
+        ];
 
-        // Primo tentativo: Gemini 3.8 Flash
-        let result = await callGemini(
-          MODELS[0],
-          env.GEMINI_API_KEY,
-          contents
-        );
+        let finalResult = null;
 
-        // Se il primo modello non è disponibile,
-        // prova automaticamente Gemini 3.7 Flash.
-        if (
-          !result.ok &&
-          (
-            isTemporaryError(result.status) ||
-            result.status === 404 ||
-            result.status === 0
-          )
-        ) {
-          result = await callGemini(
-            MODELS[1],
+        for (const model of MODELS) {
+          const result = await callGemini(
+            model,
             env.GEMINI_API_KEY,
             contents
           );
+
+          if (result.success) {
+            finalResult = result;
+            break;
+          }
+
+          finalResult = result;
+
+          const canFallback =
+            isTemporaryError(result.status) ||
+            result.status === 404;
+
+          if (!canFallback) {
+            break;
+          }
         }
 
-        if (!result.ok) {
+        if (!finalResult?.success) {
           return json({
             error: "Gemini non è riuscito a elaborare il quiz.",
-            details: result.message,
-            model: result.model,
-            status: result.status
-          }, 502);
-        }
-
-        const output = result.data.candidates?.[0]?.content?.parts
-          ?.map(part => part.text || "")
-          .join("");
-
-        if (!output) {
-          return json({
-            error: "Gemini non ha restituito una risposta leggibile.",
-            model: result.model
-          }, 502);
-        }
-
-        let parsed;
-
-        try {
-          parsed = JSON.parse(output);
-        } catch {
-          return json({
-            error: "La risposta AI non è in un formato valido."
-          }, 502);
-        }
-
-        if (!Array.isArray(parsed.questions)) {
-          return json({
-            error: "Non è stato possibile individuare le domande."
+            details: finalResult?.message ||
+              "Servizio AI temporaneamente non disponibile.",
+            status: finalResult?.status || 502
           }, 502);
         }
 
         return json({
           success: true,
-          model: result.model,
-          questions: parsed.questions
+          model: finalResult.model,
+          questions: finalResult.questions
         });
 
       } catch (error) {
